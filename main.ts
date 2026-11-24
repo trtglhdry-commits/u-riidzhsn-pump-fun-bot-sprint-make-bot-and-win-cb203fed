@@ -10,22 +10,31 @@
 //  - Track every mint's price from its virtual reserves (virtual_quote_reserves /
 //    virtual_token_reserves) and keep its trailing 60-minute high (about 9,000
 //    slots) plus its price 4 hours ago (about 36,000 slots).
-//  - Enter on strength, not on weakness: buy when the price prints a new 60-minute
-//    high and the 4-hour trend filter passes (price no more than 1% below where it
-//    was 4 hours ago; skipped for coins younger than 4 hours, where the breakout
-//    itself is the trend). The dev tape shows why: a dip-buy off the same high
-//    loses on this data (coins that dip keep dipping), while buying the breakout
-//    wins after the roughly 2.6% round-trip fee. A take-profit below that fee
-//    cannot work here, so the exits are sized for it.
-//  - Scale in on further strength: add when the price reaches 15% above the
-//    average entry, at most twice per coin.
-//  - Exit half at +20% over the average entry (fees included in the cost basis),
-//    the rest at +50%, and everything at -8%. After a stop-out the coin is
-//    blocked for an hour so a dying coin is not re-bought.
+//  - Enter on strength, not on weakness: buy when the price breaks above its
+//    trailing 60-minute high and the 4-hour trend filter passes (price no more
+//    than 1% below where it was 4 hours ago; skipped for coins younger than
+//    4 hours, where the breakout itself is the trend). The dev tape shows why:
+//    a dip-buy off the same high loses on this data (coins that dip keep
+//    dipping), while buying the breakout wins after the roughly 2.6% round-trip
+//    fee. A take-profit below that fee cannot work here, so the exits are sized
+//    for it: one take-profit at +40%, one stop at -10%.
+//  - The high a decision uses lags one batch on purpose: the batch's own prices
+//    are staged and folded into history at the next batch, so a buy fires on a
+//    breakout the tape has already printed, not on a price the bot just saw
+//    spike inside the batch it is answering. The first version compared the
+//    live price with a high that already contained it and ended up buying
+//    retests of old highs instead; its dev grade lost 4.37 SOL at an 11% win
+//    rate, which is what this revision fixes.
+//  - Fills resolve 2 slots after the decision, and a fill whose output is worse
+//    than the decision-time reserves by more than max_slippage_bps is rejected,
+//    so buys keep a tight 500 bps (a rejected buy costs nothing) while sells
+//    use 3000 bps (a stop that cannot fill on a crashing coin is worthless).
+//    A buy rejected for slippage blocks the mint for 10 minutes instead of
+//    being retried every batch.
 //  - Respect the caps: at most 5 open positions, buys on one mint in one reply
-//    spend at most 1% of its real SOL reserve, at most 16 orders per batch,
-//    500 bps max slippage. Never buy dust (under 0.05 SOL) or a coin with too
-//    few trades to judge.
+//    spend at most 1% of its real SOL reserve, at most 16 orders per batch.
+//    Never buy dust (under 0.05 SOL) or a coin with too few trades to judge,
+//    and never chase a coin that already gapped more than 15% past its high.
 //
 // Fully deterministic: every decision comes from the hello seed's run data, the
 // slot and the state. No clock, no environment, no Math.random.
@@ -36,22 +45,21 @@ import { runBot, LAMPORTS_PER_SOL, type BotState, type Batch, type OrderInput } 
 const HIGH_WINDOW_SLOTS = 9_000;
 const TREND_WINDOW_SLOTS = 36_000;
 const COOLDOWN_SLOTS = 3_600;
+const REJECT_COOLDOWN_SLOTS = 600; // 10 minutes after a buy is rejected
 
 // Slackwater's 4h trend filter: never buy a coin down more than 1% over 4 hours.
 const TREND_MIN_RETURN = -0.01;
 
 const FIRST_BUY_LAMPORTS = 500_000_000n; // 0.5 SOL
-const SCALE_BUY_LAMPORTS = 300_000_000n; // 0.3 SOL
-const MAX_SCALE_INS = 2;
-const SCALE_TRIGGER = 0.15; // add when the price is 15% above the average entry
 const MIN_BUY_LAMPORTS = 50_000_000n; // 0.05 SOL: never buy dust
 const MIN_BUY_LAMPORTS_ROUND_TRIP = 10_000_000n; // guardrail: 0.01 SOL per round trip
 
-const TAKE_PROFIT_1 = 0.20; // sell half at +20% over the average entry
-const TAKE_PROFIT_2 = 0.50; // sell the rest at +50%
-const STOP_LOSS = -0.08; // sell everything at -8%
+const TAKE_PROFIT = 0.40; // sell everything at +40% over the average entry
+const STOP_LOSS = -0.10; // sell everything at -10%
+const MAX_BREAKOUT_GAP = 0.15; // never chase more than 15% past the old high
 
-const MAX_SLIPPAGE_BPS = 500;
+const BUY_SLIPPAGE_BPS = 500;
+const SELL_SLIPPAGE_BPS = 3000;
 const MIN_TRADES_BEFORE_ENTRY = 3;
 
 /** Price samples for one mint, pruned to the trend window. */
@@ -65,16 +73,14 @@ interface MintHistory {
 }
 
 interface CoinBook {
-  /** Scale-ins already added to the open position. */
-  scaleIns: number;
-  /** Slot until which the mint is blocked after a stop-out. */
+  /** Slot until which the mint is blocked after a stop-out or a rejected buy. */
   blockedUntilSlot: number;
-  /** Highest return seen while holding, for the exit ladder (unused by the ladder, kept for logs). */
-  peakReturn: number;
 }
 
 const histories = new Map<string, MintHistory>();
 const books = new Map<string, CoinBook>();
+/** Observations from the batch being answered, folded into history next batch. */
+let staged: Array<{ mint: string; slot: number; price: number }> = [];
 
 function historyFor(mint: string): MintHistory {
   let h = histories.get(mint);
@@ -88,7 +94,7 @@ function historyFor(mint: string): MintHistory {
 function bookFor(mint: string): CoinBook {
   let b = books.get(mint);
   if (b === undefined) {
-    b = { scaleIns: 0, blockedUntilSlot: -1, peakReturn: 0 };
+    b = { blockedUntilSlot: -1 };
     books.set(mint, b);
   }
   return b;
@@ -145,14 +151,36 @@ await runBot({
     const orders: OrderInput[] = [];
     const slot = batch.slot;
 
-    // Take the batch's events in: price history for every mint that traded.
+    // Fold the previous batch's staged observations into history first, so the
+    // trailing high a decision uses never contains the batch being answered.
+    const toMerge = staged;
+    staged = [];
+    for (const o of toMerge) observe(o.mint, o.slot, o.price);
+
+    // A buy the harness rejected (usually max_slippage on a spike) blocks its
+    // mint for a while instead of being retried on every batch.
+    for (const f of batch.fills) {
+      if (f.status === 'rejected' && f.side === 'buy') {
+        bookFor(f.mint).blockedUntilSlot = slot + REJECT_COOLDOWN_SLOTS;
+      }
+    }
+
+    // Stage this batch's events: their prices reach the history next batch.
     for (const e of batch.events) {
       if (e.event === 'TradeEvent') {
         const h = historyFor(e.mint);
         h.trades += 1;
-        observe(e.mint, e.slot, priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves)));
+        staged.push({
+          mint: e.mint,
+          slot: e.slot,
+          price: priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves)),
+        });
       } else if (e.event === 'CreateEvent') {
-        observe(e.mint, e.slot, priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves)));
+        staged.push({
+          mint: e.mint,
+          slot: e.slot,
+          price: priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves)),
+        });
       } else {
         // CompleteEvent: the curve is done; forget its book so nothing re-enters.
         const b = books.get(e.mint);
@@ -162,10 +190,14 @@ await runBot({
 
     // Marks refresh the reserves of held/pending mints even on slots with no trade.
     for (const m of batch.marks) {
-      observe(m.mint, m.slot, priceOf(BigInt(m.virtual_quote_reserves), BigInt(m.virtual_token_reserves)));
+      staged.push({
+        mint: m.mint,
+        slot: m.slot,
+        price: priceOf(BigInt(m.virtual_quote_reserves), BigInt(m.virtual_token_reserves)),
+      });
     }
 
-    // Exits first: every open position against its take-profit / stop ladder.
+    // Exits first: every open position against its take-profit / stop.
     for (const [mint, holding] of state.positions) {
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
@@ -174,52 +206,17 @@ await runBot({
       const entry = avgEntryPrice(holding.token_amount, holding.cost_lamports);
       if (!(entry > 0)) continue;
       const ret = price / entry - 1;
-      const book = bookFor(mint);
-      if (ret > book.peakReturn) book.peakReturn = ret;
       if (hasPendingOrder(state, mint, 'sell')) continue;
       if (ret <= STOP_LOSS) {
-        orders.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        book.blockedUntilSlot = slot + COOLDOWN_SLOTS;
-        book.scaleIns = 0;
-        book.peakReturn = 0;
-      } else if (ret >= TAKE_PROFIT_2) {
-        orders.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        book.scaleIns = 0;
-        book.peakReturn = 0;
-      } else if (ret >= TAKE_PROFIT_1) {
-        // Sell half at the first take-profit; the rest rides to the second rung.
-        const half = holding.token_amount / 2n;
-        if (half > 0n) {
-          orders.push({ side: 'sell', mint, token_amount: half, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        }
+        orders.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
+        bookFor(mint).blockedUntilSlot = slot + COOLDOWN_SLOTS;
+      } else if (ret >= TAKE_PROFIT) {
+        orders.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
       }
     }
 
-    // Scale-ins: a held coin that prints 15% above its average entry gets more size.
-    if (orders.length < 16) {
-      for (const [mint, holding] of state.positions) {
-        if (orders.length >= 16) break;
-        const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) continue;
-        const price = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
-        if (!(price > 0)) continue;
-        const entry = avgEntryPrice(holding.token_amount, holding.cost_lamports);
-        if (!(entry > 0)) continue;
-        const book = bookFor(mint);
-        if (book.scaleIns >= MAX_SCALE_INS) continue;
-        if (hasPendingOrder(state, mint, 'buy') || hasPendingOrder(state, mint, 'sell')) continue;
-        if (price < entry * (1 + SCALE_TRIGGER)) continue;
-        const cap = state.maxBuyLamports(mint);
-        if (cap < MIN_BUY_LAMPORTS) continue;
-        const size = SCALE_BUY_LAMPORTS < cap ? SCALE_BUY_LAMPORTS : cap;
-        const free = state.freeCashLamports();
-        if (free < size + state.txFeeLamports()) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: size, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        book.scaleIns += 1;
-      }
-    }
-
-    // Entries: a new 60-minute high with the 4-hour trend filter green.
+    // Entries: a breakout above the lagged trailing 60-minute high, with the
+    // 4-hour trend filter green, not chased more than 15% past the high.
     if (orders.length < 16 && state.committedPositionCount() < state.hello.caps.max_open_positions) {
       for (const [mint, curve] of state.curves) {
         if (orders.length >= 16) break;
@@ -233,12 +230,11 @@ await runBot({
         if (book !== undefined && slot < book.blockedUntilSlot) continue;
         const price = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
         if (!(price > 0)) continue;
-        // Breakout: the price is at (or above) its trailing 60-minute high, and the
-        // high is not just the price itself from this very batch's first sighting:
-        // require the high to have been set at an earlier slot.
+        // Breakout against the lagged high: the high was set in an earlier batch,
+        // because this batch's prices only reach the history next batch.
         const high = trailingHigh(h);
         if (high <= 0 || price < high) continue;
-        if (h.highDeque.length > 0 && h.highDeque[0].slot >= slot) continue;
+        if (price > high * (1 + MAX_BREAKOUT_GAP)) continue;
         // 4-hour trend filter: not down more than 1% over 4 hours (skipped while young).
         const old = priceFourHoursAgo(h, slot);
         if (old !== null && old > 0 && price < old * (1 + TREND_MIN_RETURN)) continue;
@@ -251,10 +247,7 @@ await runBot({
           .filter((o) => o.side === 'buy')
           .reduce((sum, o) => sum + BigInt(o.quote_lamports as string), 0n);
         if (free - alreadyCommitted < size + state.txFeeLamports()) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: size, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        const b = bookFor(mint);
-        b.scaleIns = 0;
-        b.peakReturn = 0;
+        orders.push({ side: 'buy', mint, quote_lamports: size, max_slippage_bps: BUY_SLIPPAGE_BPS });
       }
     }
 
