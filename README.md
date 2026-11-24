@@ -36,7 +36,14 @@ is the kit's wire shim, `main.ts` holds the whole strategy.
 
 Graded locally on the kit's frozen dev window with
 `node cli/makefun.mjs grade-local --kit . --bot <repo> --driver process`
-(see STATE.md in the run record for the numbers; dev is not the final result).
+(dev only — the final runs on fresh 6-hour data collected after entries close,
+so this is not the final result): net PnL **-2.34 SOL** (-23.4% on 10 SOL),
+416 round trips on 416 distinct mints (guardrail: 20), win rate 14.7%,
+max drawdown 23.7% (guardrail: 50%), 830 fills, 74 rejected, 18 failed txs.
+Earlier versions on the same dev window: v1 dip-breakout -4.37 SOL, v2 breakout
+-3.14 SOL, v3 sniper 0.5 SOL size -3.84 SOL, v5 snipe on 2nd trade -2.44 SOL.
+The house sniper baseline grades -0.05 SOL on this window, so the tape punishes
+every active strategy here; this entry is the best of the five versions built.
 
 ---
 
