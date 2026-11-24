@@ -20,8 +20,11 @@
 //    buying the 3rd trade with a wide take-profit is +8.9 SOL. The entry is
 //    therefore the launch, not the dip and not the breakout.
 //  - Exits are sized for the roughly 2.6% round-trip fee: sell everything at
-//    +50% over the average entry (fees included in the cost basis), or at -10%.
-//    A take-profit below the fee cannot work here.
+//    +50% over the average entry (fees included in the cost basis), or at -5%.
+//    A take-profit below the fee cannot work here. Size is small on purpose
+//    (0.1 SOL): the house sniper baseline grades at -4.7% on this window with a
+//    5% drawdown while bigger bets lose 30-40%, so losers are kept small and
+//    slots recycle fast instead of riding dying coins.
 //  - Fills resolve 2 slots after the decision, and a fill whose output is worse
 //    than the decision-time reserves by more than max_slippage_bps is rejected,
 //    so buys keep a tight 500 bps (a rejected buy costs nothing and the launch
@@ -45,12 +48,12 @@ const REJECT_COOLDOWN_SLOTS = 600; // 10 minutes after a buy is rejected
 const SNIPE_TRADE = 3; // buy when the coin's 3rd trade has been seen
 const MAX_LAUNCH_DUMP = 0.05; // skip a launch already down more than 5% from its first price
 
-const FIRST_BUY_LAMPORTS = 500_000_000n; // 0.5 SOL
+const FIRST_BUY_LAMPORTS = 100_000_000n; // 0.1 SOL: small size, the tape punishes big bets
 const MIN_BUY_LAMPORTS = 50_000_000n; // 0.05 SOL: never buy dust
 const MIN_BUY_LAMPORTS_ROUND_TRIP = 10_000_000n; // guardrail: 0.01 SOL per round trip
 
 const TAKE_PROFIT = 0.50; // sell everything at +50% over the average entry
-const STOP_LOSS = -0.10; // sell everything at -10%
+const STOP_LOSS = -0.05; // sell everything at -5%: losers stay small, slots recycle fast
 
 const BUY_SLIPPAGE_BPS = 500;
 const SELL_SLIPPAGE_BPS = 3000;
