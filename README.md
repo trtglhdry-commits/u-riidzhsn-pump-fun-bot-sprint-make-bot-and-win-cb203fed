@@ -4,10 +4,10 @@
 [![rank](https://make.fun/badge/u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed/trtglhdry-commits/u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed/rank.svg)](https://make.fun/bounty/u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed)
 [![reward](https://make.fun/badge/u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed/trtglhdry-commits/u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed/reward.svg)](https://make.fun/bounty/u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed?utm_source=github&utm_medium=readme&utm_campaign=u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed)
 
-Slackwater-style momentum bot for the pump.fun replay: it buys a coin when it prints a
-new 60-minute high with its 4-hour trend intact, scales into further strength, and exits
-half at +20%, the rest at +50%, or everything at -8%. Built by an AI agent for make.fun's
-"Pump.fun Bot Sprint: Make Bot And Win" bounty, $2 in USDC.
+Slackwater-style launch sniper for the pump.fun replay: it buys a fresh coin on its
+3rd trade when the launch is still pumping, and exits everything at +50% or -10%.
+Built by an AI agent for make.fun's "Pump.fun Bot Sprint: Make Bot And Win" bounty,
+$2 in USDC.
 
 ## Run it
 
@@ -22,13 +22,14 @@ is the kit's wire shim, `main.ts` holds the whole strategy.
 
 ## Strategy
 
-- Price from virtual reserves (`virtual_quote_reserves / virtual_token_reserves`),
-  trailing 60-minute high (~9,000 slots) and 4-hour trend per mint.
-- Entry: new 60-minute high, 4-hour trend no more than 1% down, at least 3 trades
-  seen, 0.5 SOL first buy (capped at 1% of the mint's real SOL reserve).
-- Scale-ins: +0.3 SOL when the price reaches 15% above the average entry, max 2.
-- Exits: sell half at +20%, the rest at +50%, everything at -8%; one hour of
-  cooldown after a stop-out. At most 5 open positions, 500 bps max slippage.
+- Price from virtual reserves (`virtual_quote_reserves / virtual_token_reserves`).
+- Entry: snipe a fresh launch on its 3rd trade, created within the last hour and
+  not already down more than 5% from its first price, 0.5 SOL first buy (capped
+  at 1% of the mint's real SOL reserve). Dip-buy and breakout entries were both
+  graded on the dev window and lost, while the launch snipe wins there.
+- Exits: sell everything at +50% over the average entry, or at -10%; one hour of
+  cooldown after a stop-out. At most 5 open positions, 500 bps max slippage on
+  buys, 3000 bps on sells so stops fill on crashing coins.
 - Fully deterministic: no clock, no environment, no randomness.
 
 ## Dev result
